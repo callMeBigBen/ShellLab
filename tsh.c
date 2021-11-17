@@ -8,8 +8,7 @@
  *  Follow the 15-213/18-213/15-513 style guide at
  *  http://www.cs.cmu.edu/~213/codeStyle.html.>
  *
- * @author Your Name <andrewid@andrew.cmu.edu>
- * TODO: Include your name and Andrew ID here.
+ * @author Xuan Peng <xuanepeng@andrew.cmu.edu>
  */
 
 #include "csapp.h"
@@ -20,6 +19,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,16 +52,22 @@ void sigtstp_handler(int sig);
 void sigint_handler(int sig);
 void sigquit_handler(int sig);
 void cleanup(void);
+void waitfg(pid_t pid);
+void process_bg(char **argv);
+void process_fg(char **argv);
+
+char *envp[] = {NULL};
 
 /**
- * @brief <Write main's function header documentation. What does main do?>
+ * @brief the main function of the tiny shell program. Below functionality are
+ included:
+ 1. stderr redirect
+ 2. commandline parsing
+ 3. init job list
+ 4. install initial signal handler
+ 5. an infinite loop to process user's command, terminated when receive certain
+ signals
  *
- * TODO: Delete this comment and replace it with your own.
- *
- * "Each function should be prefaced with a comment describing the purpose
- *  of the function (in a sentence or two), the function's arguments and
- *  return value, any error cases that are relevant to the caller,
- *  any pertinent side effects, and any assumptions that the function makes."
  */
 int main(int argc, char **argv) {
     int c;
@@ -161,9 +167,8 @@ int main(int argc, char **argv) {
 }
 
 /**
- * @brief <What does eval do?>
- *
- * TODO: Delete this comment and replace it with your own.
+ * @brief parse a user-given command line and execute it.
+ * @param cmdline: the user-given command line
  *
  * NOTE: The shell is supposed to be a long-running process, so this function
  *       (and its helpers) should avoid exiting on error.  This is not to say
@@ -172,6 +177,8 @@ int main(int argc, char **argv) {
 void eval(const char *cmdline) {
     parseline_return parse_result;
     struct cmdline_tokens token;
+    sigset_t mask_all, mask_child, old_all;
+    pid_t pid;
 
     // Parse command line
     parse_result = parseline(cmdline, &token);
@@ -181,6 +188,61 @@ void eval(const char *cmdline) {
     }
 
     // TODO: Implement commands here.
+    // if current command is a built in command
+    if (token.builtin != BUILTIN_NONE) {
+        switch (token.builtin) {
+        case BUILTIN_QUIT:
+            exit(0);
+            break;
+        case BUILTIN_JOBS:
+            list_jobs(STDOUT_FILENO);
+            break;
+        case BUILTIN_BG:
+            process_bg(token.argv);
+            break;
+        case BUILTIN_FG:
+            process_fg(token.argv);
+            break;
+        case BUILTIN_NONE:
+            // Never be triggered. Just to pass compiling check
+            break;
+        }
+    }
+    // if current command is not a built in command
+    else {
+        sigfillset(&mask_all);
+        sigemptyset(&mask_child);
+        sigaddset(&mask_child, SIGCHLD);
+        // block SIGCHILD in the child process to prevent race condition
+        sigprocmask(SIG_BLOCK, &mask_child, &old_all);
+
+        // 1. do fork to create the child process
+        if ((pid = fork()) == 0) {
+            // restore the sig mask for child process
+            sigprocmask(SIG_SETMASK, &old_all, NULL);
+            // make the child process in an independent process group
+            setpgid(0, 0);
+            execve(token.argv[0], token.argv, envp);
+        }
+
+        // 2. if the command is a fg command, wait till return
+        if (parse_result == PARSELINE_FG) {
+            sigprocmask(SIG_BLOCK, &mask_all, NULL);
+            add_job(pid, FG, cmdline);
+            sigprocmask(SIG_SETMASK, &old_all, NULL);
+
+            waitfg(pid);
+        }
+        // 3. if the command is a bg command. Print its info
+        else {
+            sigprocmask(SIG_BLOCK, &mask_all, NULL);
+            add_job(pid, BG, cmdline);
+            sigprocmask(SIG_SETMASK, &old_all, NULL);
+
+            int job = job_from_pid(pid);
+            printf("[%d] (%d) %s", job, pid, cmdline);
+        }
+    }
 }
 
 /*****************
@@ -195,18 +257,36 @@ void eval(const char *cmdline) {
 void sigchld_handler(int sig) {}
 
 /**
- * @brief <What does sigint_handler do?>
- *
- * TODO: Delete this comment and replace it with your own.
+ * @brief the handler for sigint (ctrl + c)
  */
-void sigint_handler(int sig) {}
+void sigint_handler(int sig) {
+    pid_t pid = job_get_pid(fg_job());
+    int prev_errno = errno;
+
+    if (pid <= 0)
+        return;
+
+    kill(-pid, SIGINT);
+    errno = prev_errno;
+    return;
+}
 
 /**
  * @brief <What does sigtstp_handler do?>
  *
  * TODO: Delete this comment and replace it with your own.
  */
-void sigtstp_handler(int sig) {}
+void sigtstp_handler(int sig) {
+    pid_t pid = job_get_pid(fg_job());
+    int prev_errno = errno;
+
+    if (pid <= 0)
+        return;
+
+    kill(-pid, SIGTSTP);
+    errno = prev_errno;
+    return;
+}
 
 /**
  * @brief Attempt to clean up global resources when the program exits.
@@ -221,4 +301,34 @@ void cleanup(void) {
     Signal(SIGCHLD, SIG_DFL); // Handles terminated or stopped child
 
     destroy_job_list();
+}
+
+/**
+ * @brief wait for a foreground child process to exit
+ * @param pid: the pid of the foreground process
+ */
+void waitfg(pid_t pid) {
+    sigset_t mask;
+    sigemptyset(&mask);
+
+    while (pid == job_get_pid(fg_job())) {
+        sigsuspend(&mask);
+    }
+    return;
+}
+
+/**
+ * @brief process the built-in bg command
+ * @param pid: the pid of the foreground process
+ */
+void process_bg(char **argv) {
+    // TODO
+}
+
+/**
+ * @brief process the built-in fg command
+ * @param pid: the pid of the foreground process
+ */
+void process_fg(char **argv) {
+    // TODO
 }

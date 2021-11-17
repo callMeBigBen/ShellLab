@@ -423,7 +423,41 @@ void process_bg(char **argv) {
         sio_eprintf("error usage of bg command.\n");
         return;
     }
-    sio_printf("%s, %s", argv[0], argv[1]);
+
+    int id;
+    int pid;
+    int jid;
+    sigset_t mask_all, mask_prev;
+    sigfillset(&mask_all);
+    sigprocmask(SIG_BLOCK, &mask_all, &mask_prev);
+    // if this is a jid
+    if (sscanf(argv[1], "%%%d", &id) > 0) {
+        if (!job_exists(id)) {
+            sio_eprintf("%%%d: jid not exists\n", id);
+            return;
+        }
+        pid = job_get_pid(id);
+        jid = id;
+    }
+    // if this is a pid
+    else if (sscanf(argv[1], "%d", &id) > 0) {
+        if (!job_exists(job_from_pid(id))) {
+            sio_eprintf("%d: pid not exists\n", id);
+            return;
+        }
+        pid = id;
+        jid = job_from_pid(id);
+    } else {
+        sio_eprintf("there is error in your bg command.\n");
+        return;
+    }
+
+    // send a SIGCONT singal
+    kill(-pid, SIGCONT);
+    job_set_state(jid, BG);
+    // printf("[%d] (%d) %s",job->jid, job->pid, job->cmdline);
+
+    sigprocmask(SIG_SETMASK, &mask_prev, NULL);
 }
 
 /**
@@ -435,5 +469,39 @@ void process_fg(char **argv) {
         sio_eprintf("error usage of fg command.\n");
         return;
     }
-    sio_printf("%s, %s", argv[0], argv[1]);
+    int id;
+    int pid;
+    int jid;
+    sigset_t mask_all, mask_prev;
+    sigfillset(&mask_all);
+    sigprocmask(SIG_BLOCK, &mask_all, &mask_prev);
+    // if this is a jid
+    if (sscanf(argv[1], "%%%d", &id) > 0) {
+        if (!job_exists(id)) {
+            sio_eprintf("%%%d: jid not exists\n", id);
+            return;
+        }
+        pid = job_get_pid(id);
+        jid = id;
+    }
+    // if this is a pid
+    else if (sscanf(argv[1], "%d", &id) > 0) {
+        if (!job_exists(job_from_pid(id))) {
+            sio_eprintf("%d: pid not exists\n", id);
+            return;
+        }
+        pid = id;
+        jid = job_from_pid(id);
+    } else {
+        sio_eprintf("there is error in your bg command.\n");
+        return;
+    }
+
+    // send a SIGCONT singal
+    kill(-pid, SIGCONT);
+    job_set_state(jid, FG);
+    waitfg(pid);
+    // printf("[%d] (%d) %s",job->jid, job->pid, job->cmdline);
+
+    sigprocmask(SIG_SETMASK, &mask_prev, NULL);
 }

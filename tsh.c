@@ -43,6 +43,7 @@
 #define dbg_assert(...)
 #define dbg_ensures(...)
 #endif
+#define BUFLEN = 100;
 
 /* Function prototypes */
 void eval(const char *cmdline);
@@ -187,7 +188,6 @@ void eval(const char *cmdline) {
         return;
     }
 
-    // TODO: Implement commands here.
     // if current command is a built in command
     if (token.builtin != BUILTIN_NONE) {
         switch (token.builtin) {
@@ -204,33 +204,35 @@ void eval(const char *cmdline) {
             process_fg(token.argv);
             break;
         case BUILTIN_NONE:
+            sio_printf("enter builtin_none, should never be triggered");
             // Never be triggered. Just to pass compiling check
             break;
         }
     }
     // if current command is not a built in command
     else {
-        sigfillset(&mask_all);
         sigemptyset(&mask_child);
         sigaddset(&mask_child, SIGCHLD);
         // block SIGCHILD in the child process to prevent race condition
         sigprocmask(SIG_BLOCK, &mask_child, &old_all);
+        sigfillset(&mask_all);
 
         // 1. do fork to create the child process
-        if ((pid = fork()) == 0) {
+        if (!(pid = fork())) {
             // restore the sig mask for child process
             sigprocmask(SIG_SETMASK, &old_all, NULL);
             // make the child process in an independent process group
             setpgid(0, 0);
+            // child process enter execve and will never return
             execve(token.argv[0], token.argv, envp);
         }
 
         // 2. if the command is a fg command, wait till return
         if (parse_result == PARSELINE_FG) {
+            // ingore all singals
             sigprocmask(SIG_BLOCK, &mask_all, NULL);
             add_job(pid, FG, cmdline);
             sigprocmask(SIG_SETMASK, &old_all, NULL);
-
             waitfg(pid);
         }
         // 3. if the command is a bg command. Print its info
@@ -238,9 +240,8 @@ void eval(const char *cmdline) {
             sigprocmask(SIG_BLOCK, &mask_all, NULL);
             add_job(pid, BG, cmdline);
             sigprocmask(SIG_SETMASK, &old_all, NULL);
-
             int job = job_from_pid(pid);
-            printf("[%d] (%d) %s", job, pid, cmdline);
+            sio_printf("[%d] (%d) %s", job, pid, cmdline);
         }
     }
 }
@@ -250,25 +251,104 @@ void eval(const char *cmdline) {
  *****************/
 
 /**
- * @brief <What does sigchld_handler do?>
- *
- * TODO: Delete this comment and replace it with your own.
+ * @brief handler for terminated or stopped child (upon child process receiving
+ * a sigint or sigtstp) overview: 1.
  */
-void sigchld_handler(int sig) {}
+void sigchld_handler(int sig) {
+    pid_t pid;
+    int prev_errno = errno;
+    int stat_loc;
+
+    /*
+    / use a while loop instead of a single if.
+    / since multiple signal may have received but the sigchld bit
+    / would only be 1, not more
+    / so we need to check through all possible child processes
+    */
+    while ((pid = waitpid(-1, &stat_loc, WNOHANG | WUNTRACED)) > 0) {
+        jid_t jid = job_from_pid(pid);
+        // struct job_t *job = get_job(jid);
+        // if (job == NULL) {
+        //     sio_eprintf("parent received a sigchld signal from a process not
+        //     "
+        //                 "in its job list!");
+        //     return;
+        // }
+
+        sigset_t mask_all;
+        sigfillset(&mask_all);
+        sigset_t prev_mask;
+
+        /*
+        / when a child process exited naturally.
+        / delete it from our job list
+        */
+        if (WIFEXITED(stat_loc)) {
+            sigprocmask(SIG_BLOCK, &mask_all, &prev_mask);
+            delete_job(jid);
+            sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+        }
+        /*
+         when a child is terminated by a Ctrl-C
+         */
+        else if (WIFSIGNALED(stat_loc)) {
+            // char buf[BUFLEN];
+            // sprintf is a async-signal-safe function
+            // sprintf(buf, "Job [%d] (%d) terminated by signal %d", jid, pid,
+            // WTERMSIG(stat_loc));
+            sio_printf("Job [%d] (%d) terminated by signal %d", jid, pid,
+                       WTERMSIG(stat_loc));
+
+            sigprocmask(SIG_BLOCK, &mask_all, &prev_mask);
+            delete_job(jid);
+            sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+        }
+        /*
+        if the child is stopped by a Ctrl-z
+        */
+        else if (WIFSTOPPED(stat_loc)) {
+            // char buf[BUFLEN];
+            // sprintf is a async-signal-safe function
+            // sprintf(buf, "Job [%d] (%d) terminated by signal %d", jid, pid,
+            // WSTOPSIG(stat_loc));
+            sio_printf("Job [%d] (%d) terminated by signal %d", jid, pid,
+                       WSTOPSIG(stat_loc));
+
+            sigprocmask(SIG_BLOCK, &mask_all, &prev_mask);
+            delete_job(jid);
+            sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+        }
+    }
+    errno = prev_errno;
+}
 
 /**
  * @brief the handler for sigint (ctrl + c)
  */
 void sigint_handler(int sig) {
-    pid_t pid = job_get_pid(fg_job());
+    sigset_t mask_all;
+    sigfillset(&mask_all);
+    sigset_t prev_mask;
+
+    sigprocmask(SIG_BLOCK, &mask_all, &prev_mask);
+    jid_t jid = fg_job();
+
+    // if foreground job is the shell itself
+    if (jid == 0) {
+        cleanup();
+        exit(0);
+    }
+    pid_t pid = job_get_pid(jid);
     int prev_errno = errno;
 
-    if (pid <= 0)
+    if (pid <= 0) {
+        sigprocmask(SIG_SETMASK, &prev_mask, NULL);
         return;
+    }
 
     kill(-pid, SIGINT);
     errno = prev_errno;
-    return;
+    sigprocmask(SIG_SETMASK, &prev_mask, NULL);
 }
 
 /**
@@ -277,15 +357,30 @@ void sigint_handler(int sig) {
  * TODO: Delete this comment and replace it with your own.
  */
 void sigtstp_handler(int sig) {
-    pid_t pid = job_get_pid(fg_job());
+
+    sigset_t mask_all;
+    sigfillset(&mask_all);
+    sigset_t prev_mask;
+
+    sigprocmask(SIG_BLOCK, &mask_all, &prev_mask);
+    jid_t jid = fg_job();
+
+    // if foreground job is the shell itself
+    if (jid == 0) {
+        cleanup();
+        exit(0);
+    }
+    pid_t pid = job_get_pid(jid);
     int prev_errno = errno;
 
-    if (pid <= 0)
+    if (pid <= 0) {
+        sigprocmask(SIG_SETMASK, &prev_mask, NULL);
         return;
+    }
 
     kill(-pid, SIGTSTP);
     errno = prev_errno;
-    return;
+    sigprocmask(SIG_SETMASK, &prev_mask, NULL);
 }
 
 /**
@@ -322,7 +417,7 @@ void waitfg(pid_t pid) {
  * @param pid: the pid of the foreground process
  */
 void process_bg(char **argv) {
-    // TODO
+    sio_printf("%s, %s", argv[0], argv[1]);
 }
 
 /**

@@ -56,9 +56,7 @@ void cleanup(void);
 void waitfg(pid_t pid);
 void process_bg(char **argv);
 void process_fg(char **argv);
-
-char *envp[] = {NULL};
-
+extern char **environ;
 /**
  * @brief the main function of the tiny shell program. Below functionality are
  included:
@@ -204,7 +202,7 @@ void eval(const char *cmdline) {
             process_fg(token.argv);
             break;
         case BUILTIN_NONE:
-            sio_printf("enter builtin_none, should never be triggered");
+            sio_printf("enter builtin_none, should never be triggered\n");
             // Never be triggered. Just to pass compiling check
             break;
         }
@@ -224,7 +222,10 @@ void eval(const char *cmdline) {
             // make the child process in an independent process group
             setpgid(0, 0);
             // child process enter execve and will never return
-            execve(token.argv[0], token.argv, envp);
+            if (execve(token.argv[0], token.argv, environ) < 0) {
+                sio_eprintf("command %s not found\n", token.argv[0]);
+                return;
+            }
         }
 
         // 2. if the command is a fg command, wait till return
@@ -232,16 +233,16 @@ void eval(const char *cmdline) {
             // ingore all singals
             sigprocmask(SIG_BLOCK, &mask_all, NULL);
             add_job(pid, FG, cmdline);
-            sigprocmask(SIG_SETMASK, &old_all, NULL);
             waitfg(pid);
+            sigprocmask(SIG_SETMASK, &old_all, NULL);
         }
         // 3. if the command is a bg command. Print its info
         else {
             sigprocmask(SIG_BLOCK, &mask_all, NULL);
             add_job(pid, BG, cmdline);
-            sigprocmask(SIG_SETMASK, &old_all, NULL);
             int job = job_from_pid(pid);
-            sio_printf("[%d] (%d) %s", job, pid, cmdline);
+            sio_printf("[%d] (%d) %s\n", job, pid, cmdline);
+            sigprocmask(SIG_SETMASK, &old_all, NULL);
         }
     }
 }
@@ -266,7 +267,13 @@ void sigchld_handler(int sig) {
     / so we need to check through all possible child processes
     */
     while ((pid = waitpid(-1, &stat_loc, WNOHANG | WUNTRACED)) > 0) {
+        sigset_t mask_all;
+        sigfillset(&mask_all);
+        sigset_t prev_mask;
+
+        sigprocmask(SIG_BLOCK, &mask_all, &prev_mask);
         jid_t jid = job_from_pid(pid);
+        sigprocmask(SIG_SETMASK, &prev_mask, NULL);
         // struct job_t *job = get_job(jid);
         // if (job == NULL) {
         //     sio_eprintf("parent received a sigchld signal from a process not
@@ -274,10 +281,6 @@ void sigchld_handler(int sig) {
         //                 "in its job list!");
         //     return;
         // }
-
-        sigset_t mask_all;
-        sigfillset(&mask_all);
-        sigset_t prev_mask;
 
         /*
         / when a child process exited naturally.
@@ -296,7 +299,7 @@ void sigchld_handler(int sig) {
             // sprintf is a async-signal-safe function
             // sprintf(buf, "Job [%d] (%d) terminated by signal %d", jid, pid,
             // WTERMSIG(stat_loc));
-            sio_printf("Job [%d] (%d) terminated by signal %d", jid, pid,
+            sio_printf("Job [%d] (%d) terminated by signal %d\n", jid, pid,
                        WTERMSIG(stat_loc));
 
             sigprocmask(SIG_BLOCK, &mask_all, &prev_mask);
@@ -311,7 +314,7 @@ void sigchld_handler(int sig) {
             // sprintf is a async-signal-safe function
             // sprintf(buf, "Job [%d] (%d) terminated by signal %d", jid, pid,
             // WSTOPSIG(stat_loc));
-            sio_printf("Job [%d] (%d) terminated by signal %d", jid, pid,
+            sio_printf("Job [%d] (%d) terminated by signal %d\n", jid, pid,
                        WSTOPSIG(stat_loc));
 
             sigprocmask(SIG_BLOCK, &mask_all, &prev_mask);
@@ -403,11 +406,10 @@ void cleanup(void) {
  * @param pid: the pid of the foreground process
  */
 void waitfg(pid_t pid) {
-    sigset_t mask;
-    sigemptyset(&mask);
-
-    while (pid == job_get_pid(fg_job())) {
-        sigsuspend(&mask);
+    sigset_t empty_mask;
+    sigemptyset(&empty_mask);
+    while (fg_job() > 0) {
+        sigsuspend(&empty_mask);
     }
     return;
 }
@@ -417,6 +419,10 @@ void waitfg(pid_t pid) {
  * @param pid: the pid of the foreground process
  */
 void process_bg(char **argv) {
+    if (argv[0] == NULL || argv[1] == NULL) {
+        sio_eprintf("error usage of bg command.\n");
+        return;
+    }
     sio_printf("%s, %s", argv[0], argv[1]);
 }
 
@@ -425,5 +431,9 @@ void process_bg(char **argv) {
  * @param pid: the pid of the foreground process
  */
 void process_fg(char **argv) {
-    // TODO
+    if (argv[0] == NULL || argv[1] == NULL) {
+        sio_eprintf("error usage of fg command.\n");
+        return;
+    }
+    sio_printf("%s, %s", argv[0], argv[1]);
 }

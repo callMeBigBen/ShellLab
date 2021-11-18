@@ -194,24 +194,26 @@ void eval(const char *cmdline) {
     }
 
     if (token.infile != NULL) {
-        infd = open(token.infile, O_RDONLY);
+        infd = open(token.infile, O_RDONLY, ((DEF_MODE) & (~DEF_UMASK)));
         if (infd < 0) {
-            sio_eprintf("open infile failed. %s", token.infile);
+            if (errno == ENOENT) {
+                sio_eprintf("%s: No such file or directory\n", token.infile);
+            } else {
+                sio_eprintf("%s: Permission denied\n", token.infile);
+            }
             return;
         }
     }
 
     if (token.outfile != NULL) {
-        outfd = open(token.outfile, O_RDWR | O_CREAT | O_TRUNC,
-                     S_IWUSR | S_IRUSR | S_IWGRP | S_IRGRP | S_IROTH | S_IWOTH);
+        outfd = open(token.outfile, O_WRONLY | O_CREAT | O_TRUNC, DEF_MODE);
         if (outfd < 0) {
-            sio_eprintf("open outfile failed. %s", token.outfile);
+            sio_eprintf("%s: Permission denied\n", token.outfile);
             return;
         }
     }
     // if current command is a built in command
     if (token.builtin != BUILTIN_NONE) {
-        // sio_printf("main pid:%d \n", getpid());
         switch (token.builtin) {
         case BUILTIN_QUIT: {
             exit(0);
@@ -219,16 +221,17 @@ void eval(const char *cmdline) {
         }
         case BUILTIN_JOBS: {
             // output redirect
-            int stdout1 = dup(STDOUT_FILENO);
+            int tmpfd = dup(STDOUT_FILENO);
             if (outfd >= 0) {
                 dup2(outfd, STDOUT_FILENO);
             }
+            // every time manipulate job_list, all signal must be ignored.
             sigfillset(&mask_all);
             sigprocmask(SIG_BLOCK, &mask_all, &old_all);
             list_jobs(STDOUT_FILENO);
             sigprocmask(SIG_SETMASK, &old_all, NULL);
-            if (outfd >= 0) {
-                dup2(stdout1, STDOUT_FILENO);
+            if (outfd >= 0) { // restore redirect
+                dup2(tmpfd, STDOUT_FILENO);
             }
             break;
         }
@@ -272,8 +275,13 @@ void eval(const char *cmdline) {
             }
             // child process enter execve and will never return
             if (execve(token.argv[0], token.argv, environ) < 0) {
-                sio_eprintf("command %s not found\n", token.argv[0]);
-                return;
+                if (errno == EACCES) {
+                    sio_eprintf("%s: Permission denied\n", token.argv[0]);
+                } else {
+                    sio_eprintf("%s: No such file or directory\n",
+                                token.argv[0]);
+                }
+                exit(1);
             }
         }
         // 2. if the command is a fg command, wait till return
@@ -396,7 +404,8 @@ void waitfg(pid_t pid) {
  */
 void process_bg(char **argv) {
     if (argv[0] == NULL || argv[1] == NULL) {
-        sio_eprintf("error usage of bg command.\n");
+        sio_eprintf("bg: argument must be a PID or %%jobid\n");
+        sio_eprintf("bg command requires PID or %%jobid argument\n");
         return;
     }
 
@@ -411,7 +420,7 @@ void process_bg(char **argv) {
     if (argv[1][0] == '%') {
         id = atoi(&argv[1][1]);
         if (!job_exists(id)) {
-            sio_eprintf("%%%d: jid not exists\n", id);
+            sio_eprintf("%%%d: No such job\n", id);
             sigprocmask(SIG_SETMASK, &mask_prev, NULL);
             return;
         }
@@ -422,7 +431,6 @@ void process_bg(char **argv) {
     else {
         id = atoi(&argv[1][0]);
         if (!job_exists(job_from_pid(id))) {
-            sio_eprintf("%d: pid not exists\n", id);
             sigprocmask(SIG_SETMASK, &mask_prev, NULL);
             return;
         }
@@ -447,7 +455,8 @@ void process_bg(char **argv) {
  */
 void process_fg(char **argv) {
     if (argv[0] == NULL || argv[1] == NULL) {
-        sio_eprintf("error usage of fg command.\n");
+        sio_eprintf("fg: argument must be a PID or %%jobid\n");
+        sio_eprintf("fg command requires PID or %%jobid argument\n");
         return;
     }
 
@@ -462,7 +471,7 @@ void process_fg(char **argv) {
     if (argv[1][0] == '%') {
         id = atoi(&argv[1][1]);
         if (!job_exists(id)) {
-            sio_eprintf("%%%d: jid not exists\n", id);
+            sio_eprintf("%%%d: No such job\n", id);
             sigprocmask(SIG_SETMASK, &mask_prev, NULL);
             errno = prev_errno;
             return;
@@ -474,7 +483,6 @@ void process_fg(char **argv) {
     else {
         id = atoi(&argv[1][0]);
         if (!job_exists(job_from_pid(id))) {
-            sio_eprintf("%d: pid not exists\n", id);
             sigprocmask(SIG_SETMASK, &mask_prev, NULL);
             errno = prev_errno;
             return;

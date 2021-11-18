@@ -193,7 +193,10 @@ void eval(const char *cmdline) {
             exit(0);
             break;
         case BUILTIN_JOBS:
+            sigfillset(&mask_all);
+            sigprocmask(SIG_BLOCK, &mask_all, &old_all);
             list_jobs(STDOUT_FILENO);
+            sigprocmask(SIG_SETMASK, &old_all, NULL);
             break;
         case BUILTIN_BG:
             process_bg(token.argv);
@@ -220,14 +223,16 @@ void eval(const char *cmdline) {
             // restore the sig mask for child process
             sigprocmask(SIG_SETMASK, &old_all, NULL);
             // make the child process in an independent process group
-            setpgid(0, 0);
+            if (setpgid(0, 0) < 0) {
+                sio_eprintf("error happens when setpgid\n");
+                return;
+            }
             // child process enter execve and will never return
             if (execve(token.argv[0], token.argv, environ) < 0) {
                 sio_eprintf("command %s not found\n", token.argv[0]);
                 return;
             }
         }
-
         // 2. if the command is a fg command, wait till return
         if (parse_result == PARSELINE_FG) {
             // ingore all singals
@@ -253,7 +258,11 @@ void eval(const char *cmdline) {
 
 /**
  * @brief handler for terminated or stopped child (upon child process receiving
- * a sigint or sigtstp) overview: 1.
+ * a sigint or sigtstp)
+ *
+ * 1. if the child process is terminated, then delete the child process from job
+ * list
+ * 2. if the child process is stopped, then change its state to Stopped
  */
 void sigchld_handler(int sig) {
     pid_t pid;
@@ -273,23 +282,13 @@ void sigchld_handler(int sig) {
 
         sigprocmask(SIG_BLOCK, &mask_all, &prev_mask);
         jid_t jid = job_from_pid(pid);
-        sigprocmask(SIG_SETMASK, &prev_mask, NULL);
-        // struct job_t *job = get_job(jid);
-        // if (job == NULL) {
-        //     sio_eprintf("parent received a sigchld signal from a process not
-        //     "
-        //                 "in its job list!");
-        //     return;
-        // }
 
         /*
         / when a child process exited naturally.
         / delete it from our job list
         */
         if (WIFEXITED(stat_loc)) {
-            sigprocmask(SIG_BLOCK, &mask_all, &prev_mask);
             delete_job(jid);
-            sigprocmask(SIG_SETMASK, &prev_mask, NULL);
         }
         /*
          when a child is terminated by a Ctrl-C
@@ -301,10 +300,7 @@ void sigchld_handler(int sig) {
             // WTERMSIG(stat_loc));
             sio_printf("Job [%d] (%d) terminated by signal %d\n", jid, pid,
                        WTERMSIG(stat_loc));
-
-            sigprocmask(SIG_BLOCK, &mask_all, &prev_mask);
             delete_job(jid);
-            sigprocmask(SIG_SETMASK, &prev_mask, NULL);
         }
         /*
         if the child is stopped by a Ctrl-z
@@ -316,74 +312,11 @@ void sigchld_handler(int sig) {
             // WSTOPSIG(stat_loc));
             sio_printf("Job [%d] (%d) terminated by signal %d\n", jid, pid,
                        WSTOPSIG(stat_loc));
-
-            sigprocmask(SIG_BLOCK, &mask_all, &prev_mask);
-            delete_job(jid);
-            sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+            job_set_state(jid, ST);
         }
-    }
-    errno = prev_errno;
-}
-
-/**
- * @brief the handler for sigint (ctrl + c)
- */
-void sigint_handler(int sig) {
-    sigset_t mask_all;
-    sigfillset(&mask_all);
-    sigset_t prev_mask;
-
-    sigprocmask(SIG_BLOCK, &mask_all, &prev_mask);
-    jid_t jid = fg_job();
-
-    // if foreground job is the shell itself
-    if (jid == 0) {
-        cleanup();
-        exit(0);
-    }
-    pid_t pid = job_get_pid(jid);
-    int prev_errno = errno;
-
-    if (pid <= 0) {
         sigprocmask(SIG_SETMASK, &prev_mask, NULL);
-        return;
     }
-
-    kill(-pid, SIGINT);
     errno = prev_errno;
-    sigprocmask(SIG_SETMASK, &prev_mask, NULL);
-}
-
-/**
- * @brief <What does sigtstp_handler do?>
- *
- * TODO: Delete this comment and replace it with your own.
- */
-void sigtstp_handler(int sig) {
-
-    sigset_t mask_all;
-    sigfillset(&mask_all);
-    sigset_t prev_mask;
-
-    sigprocmask(SIG_BLOCK, &mask_all, &prev_mask);
-    jid_t jid = fg_job();
-
-    // if foreground job is the shell itself
-    if (jid == 0) {
-        cleanup();
-        exit(0);
-    }
-    pid_t pid = job_get_pid(jid);
-    int prev_errno = errno;
-
-    if (pid <= 0) {
-        sigprocmask(SIG_SETMASK, &prev_mask, NULL);
-        return;
-    }
-
-    kill(-pid, SIGTSTP);
-    errno = prev_errno;
-    sigprocmask(SIG_SETMASK, &prev_mask, NULL);
 }
 
 /**
@@ -406,11 +339,13 @@ void cleanup(void) {
  * @param pid: the pid of the foreground process
  */
 void waitfg(pid_t pid) {
+    int prev_errno = errno;
     sigset_t empty_mask;
     sigemptyset(&empty_mask);
     while (fg_job() > 0) {
         sigsuspend(&empty_mask);
     }
+    errno = prev_errno;
     return;
 }
 
@@ -424,6 +359,7 @@ void process_bg(char **argv) {
         return;
     }
 
+    int prev_errno = errno;
     int id;
     int pid;
     int jid;
@@ -431,33 +367,37 @@ void process_bg(char **argv) {
     sigfillset(&mask_all);
     sigprocmask(SIG_BLOCK, &mask_all, &mask_prev);
     // if this is a jid
-    if (sscanf(argv[1], "%%%d", &id) > 0) {
+    if (argv[1][0] == '%') {
+        id = atoi(&argv[1][1]);
         if (!job_exists(id)) {
             sio_eprintf("%%%d: jid not exists\n", id);
+            sigprocmask(SIG_SETMASK, &mask_prev, NULL);
             return;
         }
         pid = job_get_pid(id);
         jid = id;
     }
     // if this is a pid
-    else if (sscanf(argv[1], "%d", &id) > 0) {
+    else {
+        id = atoi(&argv[1][0]);
         if (!job_exists(job_from_pid(id))) {
             sio_eprintf("%d: pid not exists\n", id);
+            sigprocmask(SIG_SETMASK, &mask_prev, NULL);
             return;
         }
         pid = id;
         jid = job_from_pid(id);
-    } else {
-        sio_eprintf("there is error in your bg command.\n");
-        return;
     }
 
-    // send a SIGCONT singal
-    kill(-pid, SIGCONT);
-    job_set_state(jid, BG);
-    // printf("[%d] (%d) %s",job->jid, job->pid, job->cmdline);
+    // send a SIGCONT singal if the given job is a stopped job
+    if (job_get_state(jid) == ST) {
+        job_set_state(jid, BG);
+        kill(-pid, SIGCONT);
+        sio_printf("[%d] (%d) %s\n", jid, pid, job_get_cmdline(jid));
+    }
 
     sigprocmask(SIG_SETMASK, &mask_prev, NULL);
+    errno = prev_errno;
 }
 
 /**
@@ -469,6 +409,8 @@ void process_fg(char **argv) {
         sio_eprintf("error usage of fg command.\n");
         return;
     }
+
+    int prev_errno = errno;
     int id;
     int pid;
     int jid;
@@ -476,32 +418,97 @@ void process_fg(char **argv) {
     sigfillset(&mask_all);
     sigprocmask(SIG_BLOCK, &mask_all, &mask_prev);
     // if this is a jid
-    if (sscanf(argv[1], "%%%d", &id) > 0) {
+    if (argv[1][0] == '%') {
+        id = atoi(&argv[1][1]);
         if (!job_exists(id)) {
             sio_eprintf("%%%d: jid not exists\n", id);
+            sigprocmask(SIG_SETMASK, &mask_prev, NULL);
+            errno = prev_errno;
             return;
         }
         pid = job_get_pid(id);
         jid = id;
     }
     // if this is a pid
-    else if (sscanf(argv[1], "%d", &id) > 0) {
+    else {
+        id = atoi(&argv[1][0]);
         if (!job_exists(job_from_pid(id))) {
             sio_eprintf("%d: pid not exists\n", id);
+            sigprocmask(SIG_SETMASK, &mask_prev, NULL);
+            errno = prev_errno;
             return;
         }
         pid = id;
         jid = job_from_pid(id);
-    } else {
-        sio_eprintf("there is error in your bg command.\n");
-        return;
     }
 
     // send a SIGCONT singal
-    kill(-pid, SIGCONT);
     job_set_state(jid, FG);
+    kill(-pid, SIGCONT);
     waitfg(pid);
-    // printf("[%d] (%d) %s",job->jid, job->pid, job->cmdline);
 
     sigprocmask(SIG_SETMASK, &mask_prev, NULL);
+    errno = prev_errno;
+}
+
+/**
+ * @brief the handler for sigint (ctrl + c)
+ */
+void sigint_handler(int sig) {
+    int prev_errno = errno;
+    sigset_t mask_all, prev_mask;
+    sigfillset(&mask_all);
+
+    sigprocmask(SIG_BLOCK, &mask_all, &prev_mask);
+    jid_t jid = fg_job();
+
+    // if foreground job is the shell itself
+    // if (jid == 0) {
+    //     // sio_printf("trying to kill shell itself\n"); // todo
+    //     errno = prev_errno;
+    //     cleanup();
+    //     exit(0);
+    // }
+
+    if (jid != 0) {
+        pid_t pid = job_get_pid(jid);
+        kill(-pid, SIGINT);
+        sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+        errno = prev_errno;
+        return;
+    }
+
+    sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+    errno = prev_errno;
+}
+
+/**
+ * @brief handle a sigtstp signal
+ */
+void sigtstp_handler(int sig) {
+    int prev_errno = errno;
+    sigset_t mask_all, prev_mask;
+    sigfillset(&mask_all);
+
+    sigprocmask(SIG_BLOCK, &mask_all, &prev_mask);
+    jid_t jid = fg_job();
+
+    // if foreground job is the shell itself
+    // if (jid == 0) {
+    //     // sio_printf("trying to kill shell itself\n"); // todo
+    //     errno = prev_errno;
+    //     cleanup();
+    //     exit(0);
+    // }
+
+    if (jid != 0) {
+        pid_t pid = job_get_pid(jid);
+        kill(-pid, SIGTSTP);
+        sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+        errno = prev_errno;
+        return;
+    }
+
+    sigprocmask(SIG_SETMASK, &prev_mask, NULL);
+    errno = prev_errno;
 }

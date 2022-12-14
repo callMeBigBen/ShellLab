@@ -254,7 +254,7 @@ void eval(const char *cmdline) {
     else {
         sigemptyset(&mask_child);
         sigaddset(&mask_child, SIGCHLD);
-        // block SIGCHILD in the child process to prevent race condition
+        // block all signal to prevent race condition
         sigfillset(&mask_all);
         sigprocmask(SIG_BLOCK, &mask_all, &old_all);
 
